@@ -1,41 +1,37 @@
-require 'new_relic/agent/instrumentation'
-require 'new_relic/agent/instrumentation/controller_instrumentation'
 require 'grape'
 
 module NewRelic
   module Agent
     module Instrumentation
       class Grape < ::Grape::Middleware::Base
-        include ControllerInstrumentation
+        def before
+          NewRelic::Agent.set_transaction_name(transaction_name, :category => :rack)
+        end
 
-        def call!(env)
-          @env = env
-          @newrelic_request = ::Rack::Request.new(env)
-          trace_options = {
-            :category => :rack,
-            :path => "#{request_method} #{request_path}",
-            :request => @newrelic_request,
-            :params => @newrelic_request.params
-          }
-          perform_action_with_newrelic_trace(trace_options) do
-            @app_response = @app.call(@env)
-          end
+        def _nr_has_middleware_tracing
+          true
+        end
+
+        private
+
+        def transaction_name
+          "#{api_class}/#{route_method} #{route_path}"
+        end
+
+        def api_class
+          env['api.endpoint'].source.binding.eval('self')
+        end
+
+        def route_method
+          route.route_method.upcase
+        end
+
+        def route_path
+          "#{route.route_version}.#{route.route_path.gsub(/^.+:version\/|^\/|:|\(.+\)/, '').tr('/', '-')}"
         end
 
         def route
           env['api.endpoint'].routes.first
-        end
-
-        def request_path
-          path = route.route_path[1..-1].gsub('/', '-')
-          path.sub!(/\(\.:format\)\z/, '')
-          route.route_version && path.sub!(':version', route.route_version)
-
-          path
-        end
-
-        def request_method
-          @newrelic_request.request_method
         end
       end
     end
@@ -46,22 +42,28 @@ DependencyDetection.defer do
   @name = :grape
 
   depends_on do
-    defined?(::Grape) && ! ::NewRelic::Control.instance['disable_grape'] && ! ENV['DISABLE_NEW_RELIC_GRAPE']
+    !::NewRelic::Control.instance['disable_grape'] && !ENV['DISABLE_NEW_RELIC_GRAPE']
   end
 
   executes do
-    NewRelic::Agent.logger.debug 'Installing Grape instrumentation'
+    NewRelic::Agent.logger.info 'Installing Grape instrumentation'
   end
 
   executes do
-    ::Rack::Builder.class_eval do
-      alias_method :origin_use, :use
+    module Grape
+      class Endpoint
+        def call!(env)
+          extend helpers
 
-      def use(middleware, *args, &block)
-        if middleware == Grape::Middleware::Error
-          use ::NewRelic::Agent::Instrumentation::Grape
+          env['api.endpoint'] = self
+          if options[:app]
+            options[:app].call(env)
+          else
+            builder = build_middleware
+            builder.run NewRelic::Agent::Instrumentation::Grape.new(lambda { |arg| run(arg) })
+            builder.call(env)
+          end
         end
-        origin_use(middleware, *args, &block)
       end
     end
   end
